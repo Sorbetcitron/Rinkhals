@@ -5,15 +5,16 @@ import json
 import re
 import random
 import threading
-import platform
 import traceback
 import logging
 import psutil
 import requests
+import subprocess
 
 import paho.mqtt.client as paho
 import qrcode
-from gui import *
+
+import lvgl as lv
 
 
 class JSONWithCommentsDecoder(json.JSONDecoder):
@@ -23,6 +24,8 @@ class JSONWithCommentsDecoder(json.JSONDecoder):
         regex = r"""("(?:\\"|[^"])*?")|(\/\*(?:.|\s)*?\*\/|\/\/.*)"""
         s = re.sub(regex, r"\1", s)  # , flags = re.X | re.M)
         return super().decode(s)
+
+cache_items = {}
 
 def wrap(txt, width):
     tmp = ""
@@ -68,10 +71,10 @@ def ellipsis(text, length):
 def cache(getter, key = None):
     key = key or ''
     key = f'line:{sys._getframe().f_back.f_lineno}|{key}'
-    item = Cache.get(key)
+    item = cache_items.get(key)
     if item is None:
         item = getter()
-        Cache.set(key, item)
+        cache_items[key] = item
     return item
 
 
@@ -87,8 +90,9 @@ logging.getLogger().setLevel(logging.DEBUG if DEBUG else logging.INFO)
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 RINKHALS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_PATH)))
 
+USING_SIMULATOR = lv.helpers.is_windows()
 USING_SHELL = True
-if platform.system() == 'Windows':
+if USING_SIMULATOR:
     if os.system('sh -c "echo"') != 0:
         USING_SHELL = False
     else:
@@ -97,10 +101,6 @@ if platform.system() == 'Windows':
         RINKHALS_ROOT = '/mnt/' + RINKHALS_ROOT[0].lower() + RINKHALS_ROOT[2:]
 
 # Detect environment and tools
-USING_SIMULATOR = True
-if os.path.exists('/dev/fb0'):
-    USING_SIMULATOR = False
-
 if USING_SIMULATOR:
     RINKHALS_HOME = f'{RINKHALS_ROOT}/../4-apps/home/rinkhals'
     RINKHALS_VERSION = 'dev'
@@ -173,7 +173,6 @@ else:
         apps = [ a.split(' ') for a in apps ]
         return { a[0]: a[1] for a in apps }
         
-
 # Detect screen parameters
 screen_options = QT_QPA_PLATFORM.split(':')
 screen_options = [ o.split('=') for o in screen_options ]
@@ -205,71 +204,54 @@ if os.path.isfile('/useremain/dev/remote_ctrl_mode'):
     with open('/useremain/dev/remote_ctrl_mode', 'r') as f:
         REMOTE_MODE = f.read().strip()
 
-# Styling
-FONT_PATH = SCRIPT_PATH + '/AlibabaSans-Regular.ttf'
-FONT_TITLE_SIZE = 16
-FONT_SUBTITLE_SIZE = 11
-FONT_TEXT_SIZE = 14
-ICON_FONT_PATH = SCRIPT_PATH + '/MaterialIcons-Regular.ttf'
-
-COLOR_PRIMARY = (0, 128, 255)
-COLOR_SECONDARY = (96, 96, 96)
-COLOR_TEXT = (255, 255, 255)
-COLOR_BACKGROUND = (0, 0, 0)
-COLOR_DANGER = (255, 64, 64)
-COLOR_SUBTITLE = (160, 160, 160)
-COLOR_DISABLED = (176, 176, 176)
-COLOR_SHADOW = (96, 96, 96)
-
-def debug(kwargs):
-    kwargs['tag'] = f'line {sys._getframe().f_back.f_back.f_lineno}'
-    if DEBUG:
-        kwargs['border_color'] = (255, 0, 255)
-        kwargs['border_width'] = 1
-    return kwargs
-
-def myButton(*args, left=8, right=8, top=8, height=48, font_path=FONT_PATH, font_size=FONT_TEXT_SIZE, background_color=(48, 48, 48), pressed_color=(80, 80, 80), disabled_text_color=(128, 128, 128), border_color=(96, 96, 96), border_width=1, border_radius=8, text_color=COLOR_TEXT, text_padding=12, **kwargs):
-    return Button(*args, left=left, right=right, top=top, height=height, font_path=font_path, font_size=font_size, background_color=background_color, pressed_color=pressed_color, disabled_text_color=disabled_text_color, border_color=border_color, border_width=border_width, border_radius=border_radius, text_color=text_color, text_padding=text_padding, **kwargs)
-def myStackPanel(*args, background_color=(32, 32, 32), **kwargs):
-    return StackPanel(*args, background_color=background_color, **debug(kwargs))
-def myScrollPanel(*args, background_color=(32, 32, 32), distance_threshold=32, **kwargs):
-    return ScrollPanel(*args, background_color=background_color, distance_threshold=distance_threshold, **debug(kwargs))
-def myPanel(*args, background_color=(32, 32, 32), **kwargs):
-    return Panel(*args, background_color=background_color, **debug(kwargs))
-def myLabel(*args, font_path=FONT_PATH, font_size=FONT_TEXT_SIZE, text_color=COLOR_TEXT, **kwargs):
-    return Label(*args, font_path=font_path, font_size=font_size, text_color=text_color, **debug(kwargs))
-def myCheckBox(*args, width=40, height=40, font_path=ICON_FONT_PATH, font_size=28, background_color=(48, 48, 48), border_color=(96, 96, 96), border_width=1, border_radius=8, text_color=COLOR_TEXT, check_symbol='', **kwargs):
-    return CheckBox(*args, width=width, height=height, font_path=font_path, font_size=font_size, background_color=background_color, border_color=border_color, border_width=border_width, border_radius=border_radius, text_color=text_color, check_symbol=check_symbol, **kwargs)
-
 
 class Program:
-    screen = None
+    display = None
 
     def __init__(self):
-        if USING_SIMULATOR:
-            self.screen = SimulatorScreen('Kobra simulator', SCREEN_WIDTH, SCREEN_HEIGHT)
-        else:
-            self.screen = TouchFramebuffer('/dev/fb0', '/dev/input/event0', rotation=SCREEN_ROTATION, touch_calibration=(TOUCH_CALIBRATION_MIN_X, TOUCH_CALIBRATION_MIN_Y, TOUCH_CALIBRATION_MAX_X, TOUCH_CALIBRATION_MAX_Y))
+        lv.init()
+
+        if lv.helpers.is_windows():
+            self.display = lv.windows_create_display('Rinkhals', SCREEN_WIDTH, SCREEN_HEIGHT, 100, False, True)
+            touch = lv.windows_acquire_pointer_indev(self.display)
+            touch.set_display(self.display)
+
+        elif lv.helpers.is_linux():
+            self.display = lv.linux_fbdev_create()
+            lv.linux_fbdev_set_file(self.display, '/dev/fb0')
+
+            if SCREEN_ROTATION == 0: self.display.set_rotation(lv.DISPLAY_ROTATION._0)
+            elif SCREEN_ROTATION == 90: self.display.set_rotation(lv.DISPLAY_ROTATION._90)
+            elif SCREEN_ROTATION == 180: self.display.set_rotation(lv.DISPLAY_ROTATION._180)
+            elif SCREEN_ROTATION == 270 or SCREEN_ROTATION == -90: self.display.set_rotation(lv.DISPLAY_ROTATION._270)
+
+            touch = lv.evdev_create(lv.INDEV_TYPE.POINTER, '/dev/input/event0')
+            touch.set_display(self.display)
+
+            lv.evdev_set_calibration(touch, TOUCH_CALIBRATION_MIN_X, TOUCH_CALIBRATION_MIN_Y, TOUCH_CALIBRATION_MAX_X, TOUCH_CALIBRATION_MAX_Y)
 
         if KOBRA_MODEL_CODE == 'KS1':
-            self.screen.scale = 1.5
+            self.display.set_dpi(180)
+        else:
+            self.display.set_dpi(130)
 
-        logging.debug(f'Simulator: {USING_SIMULATOR}')
         logging.debug(f'Root: {RINKHALS_ROOT}')
         logging.debug(f'Home: {RINKHALS_HOME}')
 
         # Subscribe to print event to exit in case of print
-        if not USING_SIMULATOR and REMOTE_MODE == 'lan':
+        if not lv.helpers.is_linux() and REMOTE_MODE == 'lan':
             self.monitor_mqtt()
 
         # Monitor K3SysUi process to exit if it dies
-        if not USING_SIMULATOR:
+        if lv.helpers.is_linux():
             monitor_thread = threading.Thread(target = self.monitor_k3sysui)
             monitor_thread.start()
 
         # Layout and draw
+        global lvr
+        import lvgl_rinkhals as lvr
+
         self.layout()
-        self.screen.draw()
 
     def monitor_k3sysui(self):
         pid = shell("ps | grep K3SysUi | grep -v grep | awk '{print $1}'")
@@ -315,6 +297,114 @@ class Program:
         client.loop_start()
 
     def layout(self):
+
+        self.screen_rinkhals = lvr.screen()
+        if self.screen_rinkhals:
+            self.screen_rinkhals.set_flex_flow(lv.FLEX_FLOW.COLUMN)
+            self.screen_rinkhals.set_flex_align(lv.FLEX_ALIGN.CENTER, lv.FLEX_ALIGN.CENTER, lv.FLEX_ALIGN.CENTER)
+            self.screen_rinkhals.set_style_pad_row(-lv.dpx(3), lv.STATE_DEFAULT)
+
+            rinkhals_icon = lvr.image(self.screen_rinkhals)
+            rinkhals_icon.set_src(SCRIPT_PATH + '/icon.png')
+            lvr.scale_image(rinkhals_icon, lv.dpx(90))
+
+            label_rinkhals = lvr.title(self.screen_rinkhals)
+            label_rinkhals.set_text('Rinkhals')
+            label_rinkhals.set_style_pad_top(lv.dpx(20), lv.STATE_DEFAULT)
+            label_rinkhals.set_style_pad_bottom(lv.dpx(10), lv.STATE_DEFAULT)
+            
+            self.screen_rinkhals.label_firmware = lvr.subtitle(self.screen_rinkhals)
+            self.screen_rinkhals.label_firmware.set_text('Firmware:')
+
+            self.screen_rinkhals.label_version = lvr.subtitle(self.screen_rinkhals)
+            self.screen_rinkhals.label_version.set_text('Version:')
+            
+            self.screen_rinkhals.label_root = lvr.subtitle(self.screen_rinkhals)
+            self.screen_rinkhals.label_root.set_text('Root: ?')
+            
+            self.screen_rinkhals.label_home = lvr.subtitle(self.screen_rinkhals)
+            self.screen_rinkhals.label_home.set_text('Home: ?')
+            
+            self.screen_rinkhals.label_disk = lvr.subtitle(self.screen_rinkhals)
+            self.screen_rinkhals.label_disk.set_text('Disk usage: ?')
+
+            button_exit = lvr.button_icon(self.screen_rinkhals)
+            button_exit.add_flag(lv.OBJ_FLAG.IGNORE_LAYOUT)
+            button_exit.align(lv.ALIGN.TOP_LEFT, -lvr.GLOBAL_PADDING, -lvr.GLOBAL_PADDING)
+            button_exit.set_style_border_width(0, lv.STATE_DEFAULT)
+            button_exit.set_style_bg_color(lvr.COLOR_BACKGROUND, lv.STATE_DEFAULT)
+            button_exit.add_event_cb(lambda e: self.quit(), lv.EVENT_CODE.CLICKED, None)
+            button_exit_label = lvr.label(button_exit)
+            button_exit_label.center()
+            button_exit_label.set_text('')
+
+        self.screen_main = lvr.screen()
+        if self.screen_main:
+            self.screen_main.set_flex_flow(lv.FLEX_FLOW.COLUMN)
+            self.screen_main.set_flex_align(lv.FLEX_ALIGN.START, lv.FLEX_ALIGN.CENTER, lv.FLEX_ALIGN.CENTER)
+            self.screen_main.set_style_pad_row(lvr.GLOBAL_PADDING, lv.STATE_DEFAULT)
+
+            self.screen_main.button_apps = lvr.button(self.screen_main)
+            self.screen_main.button_apps.set_width(lv.pct(100))
+            button_apps_label = lv.label(self.screen_main.button_apps)
+            button_apps_label.set_text('Manage apps')
+            button_apps_label.center()
+            
+            self.screen_main.button_ota = lvr.button(self.screen_main)
+            self.screen_main.button_ota.set_width(lv.pct(100))
+            button_ota_label = lv.label(self.screen_main.button_ota)
+            button_ota_label.set_text('Check for updates')
+            button_ota_label.center()
+
+            self.screen_main.button_settings = lvr.button(self.screen_main)
+            self.screen_main.button_settings.set_width(lv.pct(100))
+            button_settings_label = lv.label(self.screen_main.button_settings)
+            button_settings_label.set_style_text_color(lvr.COLOR_DANGER, lv.STATE_DEFAULT)
+            button_settings_label.set_text('Advanced settings')
+            button_settings_label.center()
+            
+        self.screen_container = lvr.screen()
+
+        if SCREEN_WIDTH > SCREEN_HEIGHT:
+            self.screen_composition = lvr.screen()
+
+            self.screen_rinkhals.set_parent(self.screen_composition)
+            self.screen_container.set_parent(self.screen_composition)
+
+            lvr.label(self.screen_composition).set_text('dede')
+
+            self.screen_rinkhals.set_align(lv.ALIGN.LEFT_MID)
+            self.screen_rinkhals.set_width(lv.pct(50))
+            self.screen_rinkhals.set_height(lv.pct(100))
+            self.screen_rinkhals.center()
+
+            self.screen_container.set_align(lv.ALIGN.RIGHT_MID)
+            self.screen_container.set_width(lv.pct(50))
+            self.screen_container.set_height(lv.pct(100))
+            self.screen_container.set_style_bg_opa(lv.OPA_30, 0)
+
+            lv.screen_load(self.screen_rinkhals)
+
+        else:
+            self.screen_rinkhals.set_align(lv.ALIGN.TOP_MID)
+            self.screen_rinkhals.set_width(lv.pct(100))
+            self.screen_rinkhals.set_height(lv.pct(50))
+
+            self.screen_main.set_align(lv.ALIGN.BOTTOM_MID)
+            self.screen_main.set_width(lv.pct(100))
+            self.screen_main.set_height(lv.pct(50))
+            
+            screen_composition = lvr.screen()
+            self.screen_rinkhals.set_parent(screen_composition)
+            self.screen_main.set_parent(screen_composition)
+
+            self.screen_main = screen_composition
+            lv.screen_load(self.screen_container)
+
+
+        #self.screen_main.set_parent(self.screen_container)
+        return
+
         # Rinkhals logo and general information
         self.panel_rinkhals = myPanel(left=0, top=0, bottom=0, components=[
             myStackPanel(left=0, right=0, top=0, bottom=0, background_color=None, components=[
@@ -898,7 +988,7 @@ class Program:
         if panel == self.panel_apps: self.layout_apps()
 
         self.panel_screen.layout()
-    def show_text_dialog(self, text, action='OK', action_color=COLOR_TEXT, callback=None):
+    def show_text_dialog(self, text, action='OK', action_color=None, callback=None):
         def button_callback():
             self.panel_dialog.visible = False
             self.screen.layout()
@@ -974,8 +1064,10 @@ class Program:
         if not USING_SIMULATOR:
             os.system(f'dd if=/dev/zero of=/dev/fb0 bs={self.screen.width * 4} count={self.screen.height}')
     def run(self):
-        self.screen.run()
-        self.quit()
+        while True:
+            lv.tick_inc(16)
+            lv.timer_handler()
+            time.sleep(0.016)
     def quit(self):
         logging.info('Exiting Rinkhals UI...')
         time.sleep(0.25)
@@ -998,7 +1090,7 @@ if __name__ == "__main__":
             for thread_id, stack in frames.items():
                 if thread_id == threading.main_thread().ident:
                     print(traceback.format_exc())
-                else:
+                elif thread_id in threads:
                     print(f'-- Thread {thread_id}: {threads[thread_id]} --')
                     print(' '.join(traceback.format_list(traceback.extract_stack(stack))))
             
